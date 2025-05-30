@@ -63,7 +63,7 @@ class Text_Mmamba_pl(L.LightningModule):
                 self_atten_layers = self.config['model']['self_atten_layers'],
                 is_incontext = self.config['model']['is_incontext'],
                 is_pure_mamba = self.config['model']['is_pure_mamba'],
-                )
+            )
         except:
             self.music_model = Text_Mmamba(
                 layers = self.config['model']['layers'],
@@ -76,7 +76,7 @@ class Text_Mmamba_pl(L.LightningModule):
                 self_atten_layers = self.config['model']['self_atten_layers'],
                 is_incontext = False,
                 is_pure_mamba = False,
-                )
+            )
         
         # log for the configuration
         self.save_hyperparameters()
@@ -86,6 +86,7 @@ class Text_Mmamba_pl(L.LightningModule):
     def training_step(self, batch, batch_idx):
         # print(batch)
         x, x_mask, y, text = batch
+        text = text["description"]
         text_embedding = text
         
         # # process text
@@ -123,6 +124,8 @@ class Text_Mmamba_pl(L.LightningModule):
             
             losses += loss
         self.training_step_outputs.append( losses / self.config['model']['codec_layer'] )
+        # output losses to wandb
+        self.log("train_loss", loss, on_step=True, on_epoch=True)
         return losses
     
     @torch.no_grad()
@@ -205,6 +208,11 @@ class Text_Mmamba_pl(L.LightningModule):
     #     # self.log("training_epoch_mean", epoch_mean)
     #     # free up the memory
     #     # self.training_epoch_outputs.clear()
+    def on_train_epoch_end(self):
+        if self.current_epoch+1 % 50 == 0:
+            ckpt_path = os.path.join(self.trainer.default_root_dir, f"manual_epoch{self.current_epoch}.ckpt")
+            self.trainer.save_checkpoint(ckpt_path)
+            print(f"📦 Saved checkpoint at epoch {self.current_epoch}")
     
     def configure_optimizers(self):
         # optimizer setting

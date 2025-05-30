@@ -1,25 +1,27 @@
-# pytorch
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torch import nn
-import torch.nn.functional as F
-from pl_model import Text_Mmamba_pl
-import lightning as L
-from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-# others
-from glob import glob
-import numpy as np
 import os
 import json
-from tqdm import tqdm
 import math
 import argparse
-from transformers import T5EncoderModel, T5Tokenizer
+import numpy as np
+from glob import glob
+from tqdm import tqdm
+# pytorch
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+# lightning
+import lightning as L
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.loggers import WandbLogger
+# dataloader and model
 from dataloader import *
+from pl_model import Text_Mmamba_pl
+from transformers import T5EncoderModel, T5Tokenizer
+
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# torch.multiprocessing.set_start_method('spawn')
 
 def cal_torch_model_params(model):
     '''
@@ -44,15 +46,15 @@ def parse_opt():
     # parser.add_argument('--metadata_path', type=str,
     #                     help='metadata path.', default='/mnt/gestalt/home/lonian/datasets/MusicBench/musicbench_train_simba.json')  
     parser.add_argument('--root_path', type=str,
-                        help='dataset root path.', default='/mnt/gestalt/home/lonian/datasets/Jamendo')
+                        help='dataset root path.', default='/home/yihsin/midicaps-mini-parsed')
     parser.add_argument('--ckpt_save_path', type=str,
                         help='specify the dir where the model ckpt save', default='./ckpts')
         
     # about model
     parser.add_argument('--model_type', type=str, choices=['transformer', 'simba', 'mamba', 'hybrid'], 
-                        help='model backbone', required=True)
+                        help='model backbone', default='simba')
     parser.add_argument('--layer_num', type=int,
-                        help='layers of model', default=24)
+                        help='layers of model', default=12)
     parser.add_argument('--d_state', type=int,
                         help='state size of mamba', default=512)
     parser.add_argument("-i", "--is_incontext", action="store_true")
@@ -87,7 +89,7 @@ def main():
         max_grad_norm = 1
         device = opt.device
         accumulation_step = opt.accumulation_step
-        dataset_type = 'Jamendo'
+        dataset_type = 'midicaps-mini'
         
         is_pure_mamba=False
         if opt.model_type == 'transformer':
@@ -116,9 +118,9 @@ def main():
         }
         config['model'] = {
             'layers':opt.layer_num,
-            'vocab_size':1024+1,
+            'vocab_size': 530+1, #1024+1,
             'codec_layer': opt.codec_layer,
-            'd_model':1024,
+            'd_model': 512, #1024,
             'drop_p':0.3,
             'd_state':opt.d_state,
             'num_heads': 8,
@@ -171,12 +173,7 @@ def main():
         model_structure = model_to_dict(model)
         with open(os.path.join(ckpt_folder, 'model_structure.json'), "w") as f:
             json.dump(model_structure, f, indent=4)
-            
-        # train_data = Jamendo_Dataset(root_path = opt.root_path)
-        # train_loader = DataLoader(dataset=train_data, batch_size = BATCH, shuffle=True, num_workers=4, pin_memory=True)
-        
-        # trainer = L.Trainer(**trainer_params)
-        # trainer.fit(model=model, train_dataloaders=train_loader)
+
     else:
         
         config_path = os.path.join(opt.ckpt[::-1].split('/', 4)[-1][::-1], 'config.json')
@@ -198,10 +195,20 @@ def main():
             'callbacks': [L.pytorch.callbacks.ModelCheckpoint(every_n_train_steps=500, save_top_k=-1)],
         }
     # torch.backends.cuda.enable_flash_sdp(True)
-    train_data = Jamendo_Dataset(root_path = opt.root_path, codec_layer=config['model']['codec_layer'], is_incontext = config['model']['is_incontext'])
+    # train_data = Jamendo_Dataset(root_path = opt.root_path, codec_layer=config['model']['codec_layer'], is_incontext = config['model']['is_incontext'])
+    # train_loader = DataLoader(dataset=train_data, batch_size = config['training']['batch'], shuffle=True, num_workers=4, pin_memory=True)
+    train_data = MIDICaps_Dataset(
+        root_path = opt.root_path, 
+        trv = "train",
+        codec_layer=config['model']['codec_layer'], 
+        is_incontext = config['model']['is_incontext']
+    )
     train_loader = DataLoader(dataset=train_data, batch_size = config['training']['batch'], shuffle=True, num_workers=4, pin_memory=True)
     
-    trainer = L.Trainer(**trainer_params)
+    # wandb logger
+    wandb_logger = WandbLogger(project="midicaps-gen", name="simple-trial-1")
+
+    trainer = L.Trainer(logger=wandb_logger, **trainer_params)
     trainer.fit(model=model, train_dataloaders=train_loader, ckpt_path=opt.ckpt)
 
 

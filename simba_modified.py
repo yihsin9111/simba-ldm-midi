@@ -9,7 +9,9 @@ import torch.fft
 # from timm.models.vision_transformer import _cfg
 import math
 import numpy as np
-from mamba_ssm import Mamba, Mamba2
+# from mamba_ssm import Mamba, Mamba2
+from mamba_ssm import Mamba
+from mamba_ssm.modules.mamba2 import Mamba2
 from mamba_ssm.ops.triton.layer_norm import RMSNorm
 
 from inspect import isfunction
@@ -283,6 +285,7 @@ class AttentionBase(nn.Module):
         q, k, v = rearrange_many((q, k, v), "b n (h d) -> b h n d", h=self.num_heads)
 
         if not self.use_flash:
+            # print("not using flash")
             if is_causal and not mask:
                 # Mask out future tokens for causal attention
                 mask = causal_mask(q, k)
@@ -293,11 +296,14 @@ class AttentionBase(nn.Module):
 
             # Get attention matrix with softmax
             # need to return for visualization
-            attn = sim.softmax(dim=-1, dtype=torch.float32)
-            attn = self.drop(attn)
+            attn_mat = sim.softmax(dim=-1, dtype=torch.float32)
+            attn = self.drop(attn_mat)
             
             # Compute values
             out = einsum("... n m, ... m d -> ... n d", attn, v)
+            out = rearrange(out, "b h n d -> b n (h d)")
+            
+            return self.to_out(out), attn_mat
         else:
             # with sdp_kernel(*self.sdp_kernel_config):
             '''
@@ -309,10 +315,11 @@ class AttentionBase(nn.Module):
             # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.drop_p, is_causal=is_causal)
             # out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.drop_p, is_causal=is_causal)
-            attn = None
-
-        out = rearrange(out, "b h n d -> b n (h d)")
-        return self.to_out(out), attn
+            attn_mat = None
+            out = rearrange(out, "b h n d -> b n (h d)")
+            return self.to_out(out), attn_mat
+        
+        
 
 class Attention(nn.Module):
     def __init__(
@@ -360,6 +367,7 @@ class Attention(nn.Module):
         context_mask: Optional[Tensor] = None,  # [b, m], false is masked,
         prefix_mask: Optional[Tensor] = None,  # [b, l], false is masked,
         causal: Optional[bool] = False,
+        use_flash: Optional[bool] = True,
     ):
         assert_message = "You must provide a context when using context_features"
         assert not self.context_features or exists(context), assert_message
@@ -367,6 +375,11 @@ class Attention(nn.Module):
         context = default(context, x)
         # Normalize then compute q from input and k,v from context
         # x, context = self.norm(x), self.norm_context(context)
+
+        if not use_flash and self.attention.use_flash:
+            # print("toggle attention calculation path to slow")
+            self.attention.use_flash = False
+            self.attention.drop = nn.Dropout(self.attention.drop_p)
 
         q, k, v = (self.to_q(x), *torch.chunk(self.to_kv(context), chunks=2, dim=-1))
 
@@ -381,7 +394,11 @@ class Attention(nn.Module):
             attention, weight = self.attention(q, k, v, mask=prefix_mask, is_causal=False)
         else:
             attention, weight = self.attention(q, k, v, is_causal=self.causal or causal)
+            # print(f"attention base attention matrix: {self.attention.attn_mat}")
         
+        # if use_flash and weight==None:
+        #     print("Weight is None. Check modification.")
+
         return attention, weight
 
 class MambaLayer(nn.Module):
@@ -420,7 +437,7 @@ class MSALayer(nn.Module):
         # self.self_atten = nn.MultiheadAttention(d_model, num_heads, dropout=p, batch_first=True)
         self.self_atten = Attention(d_model, num_heads, drop_p=p)
         
-    def forward(self, x, prefix_mask=None):
+    def forward(self, x, prefix_mask=None, visualize=False):
         B, L, C = x.shape
         
         # positions = torch.arange(L, device=x.device).view(1, -1, 1)
@@ -434,13 +451,22 @@ class MSALayer(nn.Module):
         
         x_norm = self.norm(x)
         assert x_norm.shape[0] == B
-        # self-attention
-        if exists(prefix_mask):
-            attn_output, attn_output_weights = self.self_atten(x=x_norm, prefix_mask=prefix_mask, causal=False)
+
+        # visualize : without fast path
+        if visualize:
+            attn_output, attn_output_weights = self.self_atten(x=x_norm, causal=is_causal, use_flash=False)
+            x = x + self.drop(attn_output)
+            return x, attn_output_weights
+
+        # original code w/o visualization
         else:
-            attn_output, attn_output_weights = self.self_atten(x=x_norm, causal=is_causal)
-        x = x + self.drop(attn_output)
-        return x
+            # self-attention
+            if exists(prefix_mask):
+                attn_output, attn_output_weights = self.self_atten(x=x_norm, prefix_mask=prefix_mask, causal=False)
+            else:
+                attn_output, attn_output_weights = self.self_atten(x=x_norm, causal=is_causal)
+            x = x + self.drop(attn_output)
+            return x
 
 class MCALayer(nn.Module):
     '''
@@ -648,6 +674,28 @@ class SA_F_Block(nn.Module):
         x_ff = self.ff(x_self)
         return x_ff
 
+class SA_F_uc_Block(nn.Module):
+    '''
+    Only apply in in-context condition transformer
+    '''
+    def __init__(self, d_model=1024, p=0.2, num_heads=16, visualize=False):
+        super().__init__()
+        self.self_atten = MSALayer(d_model=d_model, p=p, num_heads=num_heads)
+        self.ff = FFLayer(d_model=d_model, p=p)
+        self.visualize = visualize
+        self.attn_matrix = None
+        
+    def forward(self, x, condition_embed, condition_mask):
+        B, L, C = x.shape
+        if not self.visualize:
+            x_self = self.self_atten(x, None)
+        else:
+            x_self, attn_mat = self.self_atten(x, None, visualize=True)
+            self.attn_matrix = attn_mat
+        x_ff = self.ff(x_self)
+        return x_ff
+        
+
 
 # Models
 class Mmamba(nn.Module):
@@ -703,6 +751,7 @@ class Text_Mmamba(nn.Module):
         expand=2, 
         num_heads=8, 
         self_atten_layers=[], 
+        use_self_attention = True,
         **kwargs,
     ):
         super().__init__()
@@ -713,30 +762,42 @@ class Text_Mmamba(nn.Module):
         self.backbone = nn.ModuleList()
         self.is_incontext = is_incontext
         self.is_pure_mamba = is_pure_mamba
-        
-        if not is_incontext:
-            # cross-attention
-            print("[simba] not in-context, use cross attention")
+
+        # use learnable positional embedding
+        # max length ("L" in dataloader) = 2588
+        self.pos_embedding = nn.Embedding(2588, d_model) # max_len : max length of positional embedding model
+
+        if use_self_attention:
+            print(f"+++ using self attention, with layer {layers} +++")
             for i in range(layers):
-                if i not in self_atten_layers:
-                    self.backbone.append(M_CA_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand, num_heads=num_heads))
-                else:
-                    self.backbone.append(SA_CA_F_Block(d_model=d_model, p=drop_p, num_heads=num_heads))
+                self.backbone.append(SA_F_uc_Block(d_model=d_model, p=drop_p, num_heads=16))
         else:
-            # in-context
+            print("+++ using pure mamba blocks +++")
             for i in range(layers):
-                if is_pure_mamba:
-                    self.backbone.append(MambaLayer(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand))
-                else:
-                    if i not in self_atten_layers:
-                        self.backbone.append(M_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand))
-                    else:
-                        # 原本是把mamba換成self-attn，但效果不好
-                        # self.backbone.append(SA_F_Block(d_model=d_model, p=drop_p, num_heads=num_heads))
+                self.backbone.append(M_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand))
+            
+        # if not is_incontext:
+        #     # cross-attention
+        #     for i in range(layers):
+        #         if i not in self_atten_layers:
+        #             self.backbone.append(M_CA_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand, num_heads=num_heads))
+        #         else:
+        #             self.backbone.append(SA_CA_F_Block(d_model=d_model, p=drop_p, num_heads=num_heads))
+        # else:
+        #     # in-context
+        #     for i in range(layers):
+        #         if is_pure_mamba:
+        #             self.backbone.append(MambaLayer(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand))
+        #         else:
+        #             if i not in self_atten_layers:
+        #                 self.backbone.append(M_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand))
+                    # else:
+                    #     # 原本是把mamba換成self-attn，但效果不好
+                    #     # self.backbone.append(SA_F_Block(d_model=d_model, p=drop_p, num_heads=num_heads))
                         
-                        # 這邊是把 self-attn 加入特定的層數，與 mamba 做hybrid。
-                        # 但有sequential & parallel的差別，所以要再注意一下
-                        self.backbone.append(M_SA_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand, num_heads=num_heads))
+                    #     # 這邊是把 self-attn 加入特定的層數，與 mamba 做hybrid。
+                    #     # 但有sequential & parallel的差別，所以要再注意一下
+                    #     self.backbone.append(M_SA_F_Block(d_model=d_model, p=drop_p, d_state=d_state, d_conv=d_conv, expand=expand, num_heads=num_heads))
         
         self.lm_head = nn.ModuleList([nn.Linear(d_model, vocab_size, bias=False) for _ in range(self.codec_layer)])
         # self.apply(self._init_weights)
@@ -762,62 +823,56 @@ class Text_Mmamba(nn.Module):
         # print(x.shape)
         # a = input('====================')
         # sum the codebooks
-
-        # for k in range(self.codec_layer):
-        #     indices = x[:, k]
-        #     max_idx = indices.max().item()
-        #     min_idx = indices.min().item()
-        #     vocab_size = self.embedding[k].num_embeddings
-        #     print(f"[DEBUG] Embedding {k}: max index = {max_idx}, min index = {min_idx}, vocab size = {vocab_size}")
-        for k in range(self.codec_layer):
-            assert x[:, k].max() < self.embedding[k].num_embeddings, f"Index out of range in embedding {k}"
-            assert x[:, k].min() >= 0, f"Negative index in embedding {k}"
-
         x_emb = sum([self.embedding[k](x[:, k]) for k in range(self.codec_layer)])
+
+        # add positional encoding
+        seq_len = x.size(1)  # assuming x is (B, T, codec_layer)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)  # (1, T)
+        x_emb += self.pos_embedding(positions)  # add positional info
+
+        # if self.is_incontext:
+        #     B_emb, T_emb, C_emb = x_emb.shape
+        #     # print(condition_mask.shape)
+        #     condition = self.condition_norm(self.condition_linear(condition))
+        #     # print(condition.shape)
+        #     if self.is_pure_mamba:
+        #         condition = condition * condition_mask.unsqueeze(-1)
+            
+        #     hidden_states = torch.cat([condition, x_emb], dim=1)
+        #     # print(hidden_states.shape)
+            
+        #     positions = torch.arange(
+        #             hidden_states.shape[1],
+        #             device=hidden_states.device
+        #         ).view(1, -1, 1)
+        #     pos_emb = create_sin_embedding(positions, hidden_states.shape[-1])
+        #     hidden_states = hidden_states + pos_emb
+        # else:
+        #     # add positional encoding
+        #     B_emb, T_emb, C_emb = x_emb.shape
+        #     positions = torch.arange(T_emb, device=x.device).view(1, -1, 1)
+        #     pos_emb = create_sin_embedding(positions, C_emb, max_period=10000, dtype=x.dtype)
+        #     x_emb = x_emb + pos_emb
+            
+        #     # condition pre-norm
+        #     # all layers share weight
+        #     condition = self.condition_norm(self.condition_linear(condition))
+        #     # condition_mask = (condition_mask == 0)
+        #     positions = torch.arange(
+        #             condition.shape[1],
+        #             device=condition.device
+        #         ).view(1, -1, 1)
+        #     pos_emb = create_sin_embedding(positions, condition.shape[-1])
+        #     condition = condition + pos_emb
+            
+        hidden_states = x_emb #0425 use this only
         
-        if self.is_incontext:
-            B_emb, T_emb, C_emb = x_emb.shape
-            # print(condition_mask.shape)
-            condition = self.condition_norm(self.condition_linear(condition))
-            # print(condition.shape)
-            if self.is_pure_mamba:
-                condition = condition * condition_mask.unsqueeze(-1)
-            
-            hidden_states = torch.cat([condition, x_emb], dim=1)
-            # print(hidden_states.shape)
-            
-            positions = torch.arange(
-                    hidden_states.shape[1],
-                    device=hidden_states.device
-                ).view(1, -1, 1)
-            pos_emb = create_sin_embedding(positions, hidden_states.shape[-1])
-            hidden_states = hidden_states + pos_emb
-        else:
-            # add positional encoding
-            B_emb, T_emb, C_emb = x_emb.shape
-            positions = torch.arange(T_emb, device=x.device).view(1, -1, 1)
-            pos_emb = create_sin_embedding(positions, C_emb, max_period=10000, dtype=x.dtype)
-            x_emb = x_emb + pos_emb
-            
-            # condition pre-norm
-            # all layers share weight
-            condition = self.condition_norm(self.condition_linear(condition))
-            # condition_mask = (condition_mask == 0)
-            positions = torch.arange(
-                    condition.shape[1],
-                    device=condition.device
-                ).view(1, -1, 1)
-            pos_emb = create_sin_embedding(positions, condition.shape[-1])
-            condition = condition + pos_emb
-            
-            hidden_states = x_emb
-        
-        
-        for idx, block in enumerate(self.backbone):
+        for idx, block in enumerate(self.backbone): #0425 use this
             if self.is_pure_mamba:
                 hidden_states = block(hidden_states)
             else:
-                hidden_states = block(hidden_states, condition, condition_mask)
+                #hidden_states = block(hidden_states, condition, condition_mask)
+                hidden_states = block(hidden_states, [], [])
         
         lm_logits = torch.stack([self.lm_head[k](hidden_states) for k in range(self.codec_layer)], dim=1)
         

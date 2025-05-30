@@ -90,7 +90,7 @@ class MIDICaps_Dataset(object):
     '''
     Jamendo dataset
     '''
-    def __init__(self, root_path, trv = "train", is_incontext = False, codec_layer = 1, L = 5000) -> None:
+    def __init__(self, root_path, trv = "train", is_incontext = False, codec_layer = 1, L = 2588) -> None:
         '''
         root_path = /home/yihsin/dataset/midicaps-mini-parsed/trv (train or valid)
         '''
@@ -133,7 +133,7 @@ class MIDICaps_Dataset(object):
         if self.is_incontext:
             return torch.LongTensor(data[:, :-1]), mask[0], torch.LongTensor(data[:, :]), description
 
-        return torch.LongTensor(data[:, :-1]), mask[0], torch.LongTensor(data[:, 1:]), description
+        return torch.LongTensor(data[:, :-1]), mask[0], torch.LongTensor(data[:, 1:]), {"description": description}
     
     def __len__(self):
         return len(self.midis)
@@ -150,7 +150,7 @@ if __name__ == '__main__':
     
     for batch in train_loader:
         print("x ", batch[0].shape)
-        print("mask ", batch[1].shape)
+        print("mask ", batch[1].shape, type(batch[1]))
         print("y ", batch[2].shape)
         print("caption ", batch[3])
         break  # Remove this to loop over all batches
