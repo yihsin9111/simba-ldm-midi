@@ -64,6 +64,7 @@ subfolder_name = sys.argv[3]
 config_path = model_path[::-1].split('/', 4)[-1][::-1]+'/config.json'
 with open(config_path) as f:
     config = json.load(f)
+
 model = Text_Mmamba_pl.load_from_checkpoint(model_path, config)
 model.eval()
 model.freeze()

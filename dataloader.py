@@ -104,7 +104,7 @@ class MIDICaps_Dataset(object):
         
         self.codec_layer = codec_layer
         self.length = L
-        self.special_token_id = 1024
+        self.special_token_id = 530 # note: special token id = 530
         self.is_incontext = is_incontext
 
         print(f"[dataloader] {trv} set initialization done with {len(self.midis)} files.")
@@ -127,13 +127,15 @@ class MIDICaps_Dataset(object):
         # data = to_delay(data) 
         # will get the same pattern since 
         # 學長好像有說過某個要分成很多個track的delay pattern? 需要去問問看
+        data = torch.LongTensor(data)
         
         # -- masking --
         mask = (data == self.special_token_id)
         if self.is_incontext:
-            return torch.LongTensor(data[:, :-1]), mask[0], torch.LongTensor(data[:, :]), description
+            return data[:, :-1], mask[0], data[:, :], description
 
-        return torch.LongTensor(data[:, :-1]), mask[0], torch.LongTensor(data[:, 1:]), {"description": description}
+        # print(type(mask), type(mask[0]))
+        return data[:, :-1], mask[0], data[:, 1:], {"description": description}
     
     def __len__(self):
         return len(self.midis)

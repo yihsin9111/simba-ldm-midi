@@ -2,7 +2,8 @@ import numpy as np
 from torch import nn
 import torch
 
-SPECIAL_ID=1024
+# SPECIAL_ID=1024
+SPECIAL_ID = 530
 
 # code pattern
 def to_delay(para):

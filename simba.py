@@ -770,7 +770,7 @@ class Text_Mmamba(nn.Module):
         #     vocab_size = self.embedding[k].num_embeddings
         #     print(f"[DEBUG] Embedding {k}: max index = {max_idx}, min index = {min_idx}, vocab size = {vocab_size}")
         for k in range(self.codec_layer):
-            assert x[:, k].max() < self.embedding[k].num_embeddings, f"Index out of range in embedding {k}"
+            assert x[:, k].max() < self.embedding[k].num_embeddings, f"Index out of range in embedding {k} with {x[:, k].max()} < {self.embedding[k].num_embeddings} "
             assert x[:, k].min() >= 0, f"Negative index in embedding {k}"
 
         x_emb = sum([self.embedding[k](x[:, k]) for k in range(self.codec_layer)])
