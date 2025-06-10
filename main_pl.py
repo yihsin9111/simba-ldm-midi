@@ -176,14 +176,17 @@ def main():
 
     else:
         
-        config_path = os.path.join(opt.ckpt[::-1].split('/', 4)[-1][::-1], 'config.json')
+        model_path = "/home/yihsin/simba-ldm-midi/midicaps-gen/r9ka35jh/checkpoints/epoch=83-step=11000.ckpt"
+        config_path = "/home/yihsin/simba-ldm-midi/0530-simple-trial/new_project/config.json"
+        print(f"[main] continue training from {model_path}")
+        # config_path = os.path.join(opt.ckpt[::-1].split('/', 4)[-1][::-1], 'config.json')
         with open(config_path) as f:
             config = json.load(f)
         
         ckpt_folder = os.path.join(opt.ckpt_save_path, config['training']['name'])
         os.makedirs(ckpt_folder, exist_ok=True)
             
-        model = Text_Mmamba_pl(config)
+        model = Text_Mmamba_pl.load_from_checkpoint(model_path, config)
         trainer_params = {
             "precision": 'bf16', #config['training']['precision'],
             "accumulate_grad_batches": opt.accumulation_step,
